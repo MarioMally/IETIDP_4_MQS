@@ -1,2 +1,5 @@
 # Matlab .asv
 *.asv
+
+# Ignore generated data file
+data/astar_cube2_results.csv
