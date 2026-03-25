@@ -19,52 +19,6 @@ subs = 1;
 t0 = 0;
 tend = 1;
 
-%% Materials
-air_regions = 1;
-copper_regions = 2;
-
-% mu_air = 1.25663753e-6;
-nu_air = 1;
-sigma_air = 0;
-% mu_copper = 1.256629e-6;
-nu_copper = 1;
-sigma_copper = 1;
-
-nu  = @(x, y, z, ind) ((ismember(ind,air_regions))*nu_air + ...
-    (~ismember(ind,air_regions))*nu_copper)*ones(size(x));
-sigma = @(x, y, z, ind) ((ismember(ind,air_regions))*sigma_air + ...
-    (~ismember(ind,air_regions))*sigma_copper)*ones(size(x));
-
-nu_mat = @(x, y, z, ind) cat(1,reshape(nu(x,y,z,ind),[1,size(x)]),...
-                               reshape(nu(x,y,z,ind),[1,size(x)]),...
-                               reshape(nu(x,y,z,ind),[1,size(x)]));
-sigma_mat = @(x, y, z, ind) cat(1,reshape(sigma(x,y,z,ind),[1,size(x)]),...
-                                  reshape(sigma(x,y,z,ind),[1,size(x)]),...
-                                  reshape(sigma(x,y,z,ind),[1,size(x)]));
-
-%% Analytical solution
-timeDep = @(t) exp(-t(:).');
-AFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(cos(y).*cos(z).*sin(x),[1,size(x)]),...
-                                 reshape(-2.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
-                                 reshape(cos(x).*cos(y).*sin(z),[1,size(x)]));
-BFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(-3.*cos(x).*sin(y).*sin(z),[1,size(x)]),...
-                                    zeros([1,size(x)]),...
-                                    reshape(3.*cos(z).*sin(x).*sin(y),[1,size(x)]));
-
-dtAFun = @(x, y, z, t) -AFun(x, y, z, t);
-EFun = @(x, y, z, t) -dtAFun(x, y, z, t);
-
-%% Source, initial condition, boundary conditions
-initFun = @(x, y, z, ind) AFun(x,y,z,0);
-
-cc_sol = @(x, y, z, ind) cat(1,reshape(3.*cos(y).*cos(z).*sin(x),[1,size(x)]),...
-                               reshape(-6.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
-                               reshape(3.*cos(x).*cos(y).*sin(z),[1,size(x)])).*nu_mat(x,y,z,ind);
-dt_sol = @(x, y, z, ind) -initFun(x,y,z,ind).*sigma_mat(x,y,z,ind);
-sourceFunS = @(x, y, z, ind) dt_sol(x, y, z, ind) + cc_sol(x, y, z, ind);
-
-dirFunS = @(x, y, z, ind) AFun(x,y,z,0);
-
 
 %% Preparation for measurements
 errBL2max = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
@@ -78,16 +32,97 @@ numIter = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
 condEst = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
 coarseSize = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
 
-filename = 'data/astar_cube2_results.csv';
+filename = 'data/astar_cyl_results.csv';
 fid = fopen(filename,'w');
 fprintf(fid,'subs,deg,divs,steps,pri,cond,iter,errBmax,errAmax,errEmax,errBa,errEa\n');
 
 for k = 1:numel(subs)
 
     %% Setup of subdomains
-    nrbarr = cnstrct_cube_nrbarr([1,1,1],subs(k)*[2,1,1]);
+    radConductor = 1.3;
+    radOuterAir = 2;
+    lenConductor = 12;
+    zSplits = 2;
+    extrVec = [0,0,lenConductor/zSplits];
+    shiftVec = [0,0,-lenConductor/2];
+    
+    % Conductor
+    srf = nrbreverse(nrbsquare([-radConductor/4,-radConductor/4],radConductor/2,radConductor/2),[1,2]);
+    vol1 = nrbdegelev(nrbextrude(srf,extrVec),[1,1,0]);
+    circCond = nrbcirc(radConductor,[0,0],deg2rad(45),deg2rad(135));
+    vol2 = nrbextrude(nrbruled(nrbextract(srf,3),circCond),extrVec);
+    vol3 = nrbtform(vol2,vecrotz(deg2rad(90)));
+    vol4 = nrbreverse(nrbtform(vol3,vecrotz(deg2rad(90))),1);
+    vol5 = nrbtform(vol4,vecrotz(deg2rad(90)));
+    
+    % Air
+    circAir = nrbcirc(radOuterAir,[0,0],deg2rad(45),deg2rad(135));
+    vol6 = nrbextrude(nrbruled(circCond,circAir),extrVec);
+    vol7 = nrbtform(vol6,vecrotz(deg2rad(90)));
+    vol8 = nrbreverse(nrbtform(vol7,vecrotz(deg2rad(90))),1);
+    vol9 = nrbtform(vol8,vecrotz(deg2rad(90)));
+    
+    nrbarr = [vol1,vol2,vol3,vol4,vol5,vol6,vol7,vol8,vol9];
+    
+    numPatches = numel(nrbarr);
+    air_regions = [(6:9)];
+    copper_regions = [(1:5)];
+    
+    for i = 1:2-1
+        for j = 1:numPatches
+            nrbarr(end+1) = nrbtform(nrbarr(j),vectrans(i*extrVec));
+        end
+        air_regions = [air_regions,(6:9) + i*numPatches];
+        copper_regions = [copper_regions,(1:5) + i*numPatches];
+    end
+    for i = 1:numel(nrbarr)
+        nrbarr(i) = nrbtform(nrbarr(i),vectrans(shiftVec));
+    end
     nrbcell = num2cell(nrbarr)';
     clear nrbarr;
+
+    %% Materials
+    % mu_air = 1.25663753e-6;
+    nu_air = 1;
+    sigma_air = 0;
+    % mu_copper = 1.256629e-6;
+    nu_copper = 1;
+    sigma_copper = 1;
+    
+    nu  = @(x, y, z, ind) ((ismember(ind,air_regions))*nu_air + ...
+        (~ismember(ind,air_regions))*nu_copper)*ones(size(x));
+    sigma = @(x, y, z, ind) ((ismember(ind,air_regions))*sigma_air + ...
+        (~ismember(ind,air_regions))*sigma_copper)*ones(size(x));
+    
+    nu_mat = @(x, y, z, ind) cat(1,reshape(nu(x,y,z,ind),[1,size(x)]),...
+                                   reshape(nu(x,y,z,ind),[1,size(x)]),...
+                                   reshape(nu(x,y,z,ind),[1,size(x)]));
+    sigma_mat = @(x, y, z, ind) cat(1,reshape(sigma(x,y,z,ind),[1,size(x)]),...
+                                      reshape(sigma(x,y,z,ind),[1,size(x)]),...
+                                      reshape(sigma(x,y,z,ind),[1,size(x)]));
+    
+    %% Analytical solution
+    timeDep = @(t) exp(-t(:).');
+    AFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(cos(y).*cos(z).*sin(x),[1,size(x)]),...
+                                     reshape(-2.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
+                                     reshape(cos(x).*cos(y).*sin(z),[1,size(x)]));
+    BFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(-3.*cos(x).*sin(y).*sin(z),[1,size(x)]),...
+                                        zeros([1,size(x)]),...
+                                        reshape(3.*cos(z).*sin(x).*sin(y),[1,size(x)]));
+    
+    dtAFun = @(x, y, z, t) -AFun(x, y, z, t);
+    EFun = @(x, y, z, t) -dtAFun(x, y, z, t);
+    
+    %% Source, initial condition, boundary conditions
+    initFun = @(x, y, z, ind) AFun(x,y,z,0);
+    
+    cc_sol = @(x, y, z, ind) cat(1,reshape(3.*cos(y).*cos(z).*sin(x),[1,size(x)]),...
+                                   reshape(-6.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
+                                   reshape(3.*cos(x).*cos(y).*sin(z),[1,size(x)])).*nu_mat(x,y,z,ind);
+    dt_sol = @(x, y, z, ind) -initFun(x,y,z,ind).*sigma_mat(x,y,z,ind);
+    sourceFunS = @(x, y, z, ind) dt_sol(x, y, z, ind) + cc_sol(x, y, z, ind);
+    
+    dirFunS = @(x, y, z, ind) AFun(x,y,z,0);
     
     % Stuff for plotting
     mid = [0;0;0];
@@ -132,7 +167,6 @@ for k = 1:numel(subs)
             [gnumGrad,~] = mp_interface(interfacesIETI, spGradCell);
             [gnumCurl,~] = mp_interface_hcurl(interfacesIETI, spCurlCell);
     
-
             % Find all dofs on interface between conductor and insulator
             intCondInsul = [];
             for i = 1:numel(interfacesIETI)
@@ -150,8 +184,16 @@ for k = 1:numel(subs)
 
             % Build global graph
             gloGraph = loc2glo_graph2(locGraphCell,gnumCurl,gnumGrad,intCondInsul);
+
+            % figure(2)
+            % clf()
+            % hold on;
+            % plot_graph_and_marked(gloGraph,{},[],[0;0;0],[],[],3,2,['r','b','c','m'])
+            
             T = minspantree(gloGraph,'Method','sparse','Type','forest');
             gloTree = T.Edges.IDs;
+            gloTreeOnCI = intersect(intCondInsul, gloTree);
+            gloPotPrimal = setdiff(gloGraph.Edges.IDs(ismember(gloGraph.Edges.Weight,[3,4])), gloTree);
     
             %% Setup DOF subsets
             ndofCell = cellfun(@(sp) sp.ndof, spCurlCell, 'UniformOutput', false);
@@ -166,18 +208,26 @@ for k = 1:numel(subs)
     
             treeCell = cellfun(@(gnum) glo2locTree(gloTree, gnum)', gnumCurl, 'UniformOutput', false);
             treeCell = cellfun(@(tree,dir) setdiff(tree,dir), treeCell, dirCell, 'UniformOutput', false); % Remove Dirichlet
-    
-            % Primal DOFs
-            priCell = cellfun(@(tree,ieti) intersect(tree,ieti), treeCell, ietiCell, 'UniformOutput', false);
+            treeOnCICell = cellfun(@(gnum) glo2locTree(gloTreeOnCI, gnum)', gnumCurl, 'UniformOutput', false);
+            treeOnCICell = cellfun(@(tree,dir) setdiff(tree,dir), treeOnCICell, dirCell, 'UniformOutput', false); % Remove Dirichlet
+            potPriCell = cellfun(@(gnum) glo2locTree(gloPotPrimal, gnum)', gnumCurl, 'UniformOutput', false);
             
             % Eliminated DOFs
             eliTreeCell = cell(numel(nrbcell),1);
             for i=1:numel(nrbcell)
                 if ismember(i,air_regions)
-                    eliTreeCell{i} = setdiff(treeCell{i},priCell{i});
+                    eliTreeCell{i} = setdiff(treeCell{i},treeOnCICell{i});
                 end
             end
             eliCell = cellfun(@(dir,eliTree) [dir;eliTree], dirCell, eliTreeCell, 'UniformOutput', false);
+
+            % Primal DOFs
+            priCell = treeOnCICell;
+            for i=1:numel(nrbcell)
+                if ismember(i,air_regions)
+                    priCell{i} = union(priCell{i},potPriCell{i});
+                end
+            end
 
             % Remaining DOFs
             remCell = cellfun(@(sp,pri,eli) setdiff((1:sp.ndof)',union(eli,pri)), spCurlCell, priCell, eliCell, 'UniformOutput', false);
@@ -195,6 +245,15 @@ for k = 1:numel(subs)
                 subsets{i}.remVol = remVolCell{i};
                 subsets{i}.remInt = remIntCell{i};
             end
+
+            % figure(1)
+            % clf()
+            % hold on;
+            % for i = 1:numel(nrbcell)
+            %     shift = nrbeval(nrbcell{i},[0.5,0.5,0.5]) - mid;
+            %     marked = {eliCell{i},priCell{i}};
+            %     plot_graph_and_marked(locGraphCell{i},marked,[],shift,[],[],3,2,['r','b','c','m'])
+            % end
        
             %% Setup IETI-constraints
             [B,Cnull] = setupCouplingMatTI(gnumCurl,ndofCumu(end));
@@ -326,9 +385,15 @@ for k = 1:numel(subs)
                     solCell = cellfun(@(sol,a) [sol,a], solCell, aCell, 'UniformOutput', false);
 
                     %% Compute error E
-                    dta = (solCell{copper_regions}(:,i+1) - solCell{copper_regions}(:,i))/dt;
-                    e = -dta;
-                    [~,errECL2(i),~] = sp_hcurl_error(spCurlCell{copper_regions}, mshCell{copper_regions}, e, @(x,y,z) EFun(x,y,z,time(i+1)), @(x,y,z) BFun(x,y,z,time(i+1)));
+                    errECL2(i) = 0;
+                    for l = 1:numel(copper_regions)
+                        ptc = copper_regions(l);
+                        dta = (solCell{ptc}(:,i+1) - solCell{ptc}(:,i))/dt;
+                        e = -dta;
+                        [~,val,~] = sp_hcurl_error(spCurlCell{ptc}, mshCell{ptc}, e, @(x,y,z) EFun(x,y,z,time(i+1)), @(x,y,z) BFun(x,y,z,time(i+1)));
+                        errECL2(i) = errECL2(i) + val^2;
+                    end
+                    errECL2(i) = sqrt(errECL2(i));
                 end
 
                 %% Save measurements
