@@ -10,9 +10,9 @@ warning('off','MATLAB:decomposition:LoadNotSupported'); %-> Composite structure 
 maxNumCompThreads(15); % Save resources if working on a Cluster
 
 %% Setup numerical tests
-degrees = 1:3;
-divs = [round(2.^(1:0.5:3))];
-steps = [round(2.^(1:1:13))];
+degrees = 2;
+divs = [round(2.^(1:0.5:4))];
+steps = [round(2.^(1:7))];
 subs = 1;
 
 %% Time setup
@@ -294,12 +294,12 @@ for k = 1:numel(subs)
             spCurl_mp = sp_multipatch(spCurlCell,msh_mp,interfaces,boundary_interfaces);
             fInit = op_f_v_mp(spCurl_mp, msh_mp, initFun);
             ML2_mp = op_u_v_mp(spCurl_mp, spCurl_mp, msh_mp, @(x,y,z) ones(size(x)));
-            [gDir_mp,dir_mp] = sp_drchlt_l2_proj(spCurl_mp, msh_mp, dirFunS, 1:numel(boundaries));
-            vol_mp = setdiff(1:spCurl_mp.ndof,dir_mp);
+            % [gDir_mp,dir_mp] = sp_drchlt_l2_proj(spCurl_mp, msh_mp, dirFunS, 1:numel(boundaries));
+            % vol_mp = setdiff(1:spCurl_mp.ndof,dir_mp);
     
-            u0_mp = zeros(spCurl_mp.ndof,1);
-            u0_mp(dir_mp) = gDir_mp*timeDep(t0);
-            u0_mp(vol_mp) = ML2_mp(vol_mp,vol_mp)\(fInit(vol_mp) - ML2_mp(vol_mp,dir_mp)*u0_mp(dir_mp));
+            u0_mp = ML2_mp\fInit;
+            % u0_mp(dir_mp) = gDir_mp*timeDep(t0);
+            % u0_mp(vol_mp) = ML2_mp(vol_mp,vol_mp)\(fInit(vol_mp) - ML2_mp(vol_mp,dir_mp)*u0_mp(dir_mp));
     
             u0Cell = cell(numel(nrbcell),1);
             for i=1:numel(nrbcell)

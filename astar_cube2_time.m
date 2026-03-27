@@ -12,7 +12,7 @@ maxNumCompThreads(15); % Save resources if working on a Cluster
 %% Setup numerical tests
 degrees = 1:3;
 divs = [round(2.^(1:0.5:3))];
-steps = [round(2.^(1:1:13))];
+steps = [round(2.^(1:1:8))];
 subs = 1;
 
 %% Time setup
