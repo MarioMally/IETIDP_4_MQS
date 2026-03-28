@@ -95,6 +95,24 @@ for k = 1:numel(subs)
         mid = mid + nrbeval(nrbcell{i},[0.5,0.5,0.5]);
     end
     mid = mid./numel(nrbcell);
+
+    %% Plot geometry
+    figure(1)
+    clf()
+    axis equal;
+    axis("vis3d")
+    hold on;
+    for i=1:numel(nrbcell)
+        if ismember(i, air_regions)
+            mynrbplot(nrbcell{i},[1,1,1],"#005aa9");
+        elseif ismember(i, copper_regions)
+            mynrbplot(nrbcell{i},[1,1,1],"#ec6500");
+        end
+    end
+    axis off;
+    set(gcf, 'Position', [100 100 1200 900]);
+    view(-34.0100,22.8736);
+    exportgraphics(gcf, 'ec_cube.png', 'Resolution', 300);
     
     %% Boundary and interfaces (all IETI + Dirichlet)
     [interfacesIETI,boundariesIETI] = nrbmultipatch([nrbcell{:}]);

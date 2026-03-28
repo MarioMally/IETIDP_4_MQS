@@ -11,7 +11,7 @@ maxNumCompThreads(15); % Save resources if working on a Cluster
 
 %% Setup numerical tests
 degrees = 2;
-divs = [round(2.^(1:0.5:4))];
+divs = [round(2.^(3.5:0.5:4))];
 steps = [round(2.^(1:7))];
 subs = 1;
 
@@ -130,6 +130,30 @@ for k = 1:numel(subs)
         mid = mid + nrbeval(nrbcell{i},[0.5,0.5,0.5]);
     end
     mid = mid./numel(nrbcell);
+
+    %% Plot geometry
+    % figure(1)
+    % clf()
+    % axis equal;
+    % axis("vis3d")
+    % hold on;
+    % for i=1:numel(nrbcell)
+    %     offset = 2*(nrbeval(nrbcell{i},[0.5,0.5,0.5]) - mid);
+    %     if i<=9
+    %         offset(3) = -1;
+    %     else
+    %         offset(3) = 1;
+    %     end
+    %     if ismember(i, air_regions)
+    %         mynrbplot(nrbtform(nrbcell{i}, vectrans(offset)), [4,4,4], "#005aa9");
+    %     elseif ismember(i, copper_regions)
+    %         mynrbplot(nrbtform(nrbcell{i}, vectrans(offset)), [4,4,4], "#ec6500");
+    %     end
+    % end
+    % axis off;
+    % set(gcf, 'Position', [100 100 1200 900]);
+    % view(-24.1375,27.6319);
+    % exportgraphics(gcf, 'ec_cyl.png', 'Resolution', 300);
     
     %% Boundary and interfaces (all IETI + Dirichlet)
     [interfacesIETI,boundariesIETI] = nrbmultipatch([nrbcell{:}]);
