@@ -1,0 +1,444 @@
+clear all;
+close all;
+restoredefaultpath();
+addpath(genpath('./utils'))
+addpath(genpath('./libraries'))
+
+warning('off','geopdes:nrbmultipatch'); %-> Warns for using nrbmultipatch instead of mp_geo_load with files
+warning('off','MATLAB:decomposition:LoadNotSupported'); %-> Composite structure don't allow to load decomposition objects (but are usable inside of spmd-blocks)
+
+maxNumCompThreads(15); % Save resources if working on a Cluster
+
+%% Setup numerical tests
+degrees = 1:3;
+divs = [round(2.^(1:0.5:4))];
+steps = [round(2.^(1:7))];
+subs = 1;
+
+%% Time setup
+t0 = 0;
+tend = 1;
+
+
+%% Preparation for measurements
+errBL2max = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+errACL2max = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+errECL2max = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+
+errB_acevedo = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+errE_acevedo = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+
+numIter = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+condEst = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+coarseSize = NaN*zeros(numel(subs),numel(degrees),numel(divs),numel(steps));
+
+filename = 'data/astar_cyl_modE_results.csv';
+fid = fopen(filename,'w');
+fprintf(fid,'subs,deg,divs,steps,pri,cond,iter,errBmax,errAmax,errEmax,errBa,errEa\n');
+
+for k = 1:numel(subs)
+
+    %% Setup of subdomains
+    radConductor = 1.3;
+    radOuterAir = 2;
+    lenConductor = 12;
+    zSplits = 2;
+    extrVec = [0,0,lenConductor/zSplits];
+    shiftVec = [0,0,-lenConductor/2];
+    
+    % Conductor
+    srf = nrbreverse(nrbsquare([-radConductor/4,-radConductor/4],radConductor/2,radConductor/2),[1,2]);
+    vol1 = nrbdegelev(nrbextrude(srf,extrVec),[1,1,0]);
+    circCond = nrbcirc(radConductor,[0,0],deg2rad(45),deg2rad(135));
+    vol2 = nrbextrude(nrbruled(nrbextract(srf,3),circCond),extrVec);
+    vol3 = nrbtform(vol2,vecrotz(deg2rad(90)));
+    vol4 = nrbreverse(nrbtform(vol3,vecrotz(deg2rad(90))),1);
+    vol5 = nrbtform(vol4,vecrotz(deg2rad(90)));
+    
+    % Air
+    circAir = nrbcirc(radOuterAir,[0,0],deg2rad(45),deg2rad(135));
+    vol6 = nrbextrude(nrbruled(circCond,circAir),extrVec);
+    vol7 = nrbtform(vol6,vecrotz(deg2rad(90)));
+    vol8 = nrbreverse(nrbtform(vol7,vecrotz(deg2rad(90))),1);
+    vol9 = nrbtform(vol8,vecrotz(deg2rad(90)));
+    
+    nrbarr = [vol1,vol2,vol3,vol4,vol5,vol6,vol7,vol8,vol9];
+    
+    numPatches = numel(nrbarr);
+    air_regions = [(6:9)];
+    copper_regions = [(1:5)];
+    
+    for i = 1:2-1
+        for j = 1:numPatches
+            nrbarr(end+1) = nrbtform(nrbarr(j),vectrans(i*extrVec));
+        end
+        air_regions = [air_regions,(6:9) + i*numPatches];
+        copper_regions = [copper_regions,(1:5) + i*numPatches];
+    end
+    for i = 1:numel(nrbarr)
+        nrbarr(i) = nrbtform(nrbarr(i),vectrans(shiftVec));
+    end
+    nrbcell = num2cell(nrbarr)';
+    clear nrbarr;
+
+    %% Materials
+    % mu_air = 1.25663753e-6;
+    nu_air = 1;
+    sigma_air = 0;
+    % mu_copper = 1.256629e-6;
+    nu_copper = 1;
+    sigma_copper = 1;
+    
+    nu  = @(x, y, z, ind) ((ismember(ind,air_regions))*nu_air + ...
+        (~ismember(ind,air_regions))*nu_copper)*ones(size(x));
+    sigma = @(x, y, z, ind) ((ismember(ind,air_regions))*sigma_air + ...
+        (~ismember(ind,air_regions))*sigma_copper)*ones(size(x));
+    
+    nu_mat = @(x, y, z, ind) cat(1,reshape(nu(x,y,z,ind),[1,size(x)]),...
+                                   reshape(nu(x,y,z,ind),[1,size(x)]),...
+                                   reshape(nu(x,y,z,ind),[1,size(x)]));
+    sigma_mat = @(x, y, z, ind) cat(1,reshape(sigma(x,y,z,ind),[1,size(x)]),...
+                                      reshape(sigma(x,y,z,ind),[1,size(x)]),...
+                                      reshape(sigma(x,y,z,ind),[1,size(x)]));
+    
+    %% Analytical solution
+    timeDep = @(t) exp(-t(:).');
+    AFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(cos(y).*cos(z).*sin(x),[1,size(x)]),...
+                                     reshape(-2.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
+                                     reshape(cos(x).*cos(y).*sin(z),[1,size(x)]));
+    BFun = @(x, y, z, t) timeDep(t).*cat(1,reshape(-3.*cos(x).*sin(y).*sin(z),[1,size(x)]),...
+                                        zeros([1,size(x)]),...
+                                        reshape(3.*cos(z).*sin(x).*sin(y),[1,size(x)]));
+    
+    dtAFun = @(x, y, z, t) -AFun(x, y, z, t);
+    EFun = @(x, y, z, t) -dtAFun(x, y, z, t);
+    
+    %% Source, initial condition, boundary conditions
+    initFun = @(x, y, z, ind) AFun(x,y,z,0);
+    
+    cc_sol = @(x, y, z, ind) cat(1,reshape(3.*cos(y).*cos(z).*sin(x),[1,size(x)]),...
+                                   reshape(-6.*cos(x).*cos(z).*sin(y),[1,size(x)]),...
+                                   reshape(3.*cos(x).*cos(y).*sin(z),[1,size(x)])).*nu_mat(x,y,z,ind);
+    dt_sol = @(x, y, z, ind) -initFun(x,y,z,ind).*sigma_mat(x,y,z,ind);
+    sourceFunS = @(x, y, z, ind) dt_sol(x, y, z, ind) + cc_sol(x, y, z, ind);
+    
+    dirFunS = @(x, y, z, ind) AFun(x,y,z,0);
+    
+    % Stuff for plotting
+    mid = [0;0;0];
+    for i=1:numel(nrbcell)
+        mid = mid + nrbeval(nrbcell{i},[0.5,0.5,0.5]);
+    end
+    mid = mid./numel(nrbcell);
+
+    %% Plot geometry
+    % figure(1)
+    % clf()
+    % axis equal;
+    % axis("vis3d")
+    % hold on;
+    % for i=1:numel(nrbcell)
+    %     offset = 2*(nrbeval(nrbcell{i},[0.5,0.5,0.5]) - mid);
+    %     if i<=9
+    %         offset(3) = -1;
+    %     else
+    %         offset(3) = 1;
+    %     end
+    %     if ismember(i, air_regions)
+    %         mynrbplot(nrbtform(nrbcell{i}, vectrans(offset)), [4,4,4], "#005aa9");
+    %     elseif ismember(i, copper_regions)
+    %         mynrbplot(nrbtform(nrbcell{i}, vectrans(offset)), [4,4,4], "#ec6500");
+    %     end
+    % end
+    % axis off;
+    % set(gcf, 'Position', [100 100 1200 900]);
+    % view(-24.1375,27.6319);
+    % exportgraphics(gcf, 'ec_cyl.png', 'Resolution', 300);
+    
+    %% Boundary and interfaces (all IETI + Dirichlet)
+    [interfacesIETI,boundariesIETI] = nrbmultipatch([nrbcell{:}]);
+    for i=1:numel(boundariesIETI)
+        dirSides(i).patch = boundariesIETI(i).patches;
+        dirSides(i).side = boundariesIETI(i).faces;
+    end
+
+    %% Load geometries
+    geoCell = cellfun(@(nrb) geo_load(nrb), nrbcell,'UniformOutput', false);
+
+    for p=1:numel(degrees)
+        for s=1:numel(divs)
+
+            %% Setup for spaces and meshes
+            degree = degrees(p)*[1 1 1];
+            degCell = cellfun(@(nrb) degree, nrbcell, 'UniformOutput', false);
+            ndiv = divs(s)*[1 1 1];
+            ndivCell = cellfun(@(nrb) ndiv, nrbcell, 'UniformOutput', false);
+            nquadCell = cellfun(@(deg) deg+1, degCell, 'UniformOutput', false);
+            regCell = cellfun(@(deg) deg-1, degCell, 'UniformOutput', false);
+    
+            [mshCell,spCurlCell,spGradCell] = cellfun(@(geo,ndiv,deg,reg,nquad) setupMeshAndSpaces(geo,ndiv,deg,reg,nquad),...
+                                    geoCell,ndivCell, degCell, regCell, nquadCell, 'UniformOutput', false);
+            
+    
+            %% Build global graph for periodic and ieti conditions
+            % Setup local graphs
+            indeces = 1:numel(nrbcell);
+            indCell = num2cell(indeces)';
+            locGraphCell = cellfun(@(sp,nrb,idx) setupLocalGraph(sp,nrb,idx,dirSides,interfacesIETI,[]),...
+                spCurlCell,nrbcell, indCell, 'UniformOutput',false);
+    
+            % Construct global numbering (for nodes and edges)
+            [gnumGrad,~] = mp_interface(interfacesIETI, spGradCell);
+            [gnumCurl,~] = mp_interface_hcurl(interfacesIETI, spCurlCell);
+    
+            % Find all dofs on interface between conductor and insulator
+            intCondInsul = [];
+            for i = 1:numel(interfacesIETI)
+                ptc1 = interfacesIETI(i).patch1;
+                ptc2 = interfacesIETI(i).patch2;
+
+                if and(ismember(ptc1,air_regions), ismember(ptc2,copper_regions))
+                    side1 = interfacesIETI(i).side1;
+                    intCondInsul = union(intCondInsul, gnumCurl{ptc1}(spCurlCell{ptc1}.boundary(side1).dofs));
+                elseif and(ismember(ptc2,air_regions), ismember(ptc1,copper_regions))
+                    side2 = interfacesIETI(i).side2;
+                    intCondInsul = union(intCondInsul, gnumCurl{ptc2}(spCurlCell{ptc2}.boundary(side2).dofs));
+                end
+            end
+
+            % Build global graph
+            gloGraph = loc2glo_graph2(locGraphCell,gnumCurl,gnumGrad,intCondInsul);
+
+            % figure(2)
+            % clf()
+            % hold on;
+            % plot_graph_and_marked(gloGraph,{},[],[0;0;0],[],[],3,2,['r','b','c','m'])
+            
+            T = minspantree(gloGraph,'Method','sparse','Type','forest');
+            gloTree = T.Edges.IDs;
+            gloTreeOnCI = intersect(intCondInsul, gloTree);
+            gloPotPrimal = setdiff(gloGraph.Edges.IDs(ismember(gloGraph.Edges.Weight,[3,4])), gloTree);
+    
+            %% Setup DOF subsets
+            ndofCell = cellfun(@(sp) sp.ndof, spCurlCell, 'UniformOutput', false);
+            ndofCumu = cumsum([0,[ndofCell{:}]]);
+    
+            [gDirCell,dirCell] = cellfun(@(sp,msh,idx) setupDirichletCondition(sp,msh,dirFunS,idx,dirSides),...
+                spCurlCell, mshCell, indCell, 'UniformOutput', false);
+    
+            ietiCell = cellfun(@(sp,msh,idx) getIETIDOFs(sp,msh,idx,interfacesIETI),...
+                spCurlCell, mshCell, indCell, 'UniformOutput', false);
+            ietiCell = cellfun(@(ieti,dir) setdiff(ieti,dir), ietiCell, dirCell, 'UniformOutput', false);
+    
+            treeCell = cellfun(@(gnum) glo2locTree(gloTree, gnum)', gnumCurl, 'UniformOutput', false);
+            treeCell = cellfun(@(tree,dir) setdiff(tree,dir), treeCell, dirCell, 'UniformOutput', false); % Remove Dirichlet
+            treeOnCICell = cellfun(@(gnum) glo2locTree(gloTreeOnCI, gnum)', gnumCurl, 'UniformOutput', false);
+            treeOnCICell = cellfun(@(tree,dir) setdiff(tree,dir), treeOnCICell, dirCell, 'UniformOutput', false); % Remove Dirichlet
+            potPriCell = cellfun(@(gnum) glo2locTree(gloPotPrimal, gnum)', gnumCurl, 'UniformOutput', false);
+            
+            % Eliminated DOFs
+            eliTreeCell = cell(numel(nrbcell),1);
+            for i=1:numel(nrbcell)
+                if ismember(i,air_regions)
+                    eliTreeCell{i} = setdiff(treeCell{i},treeOnCICell{i});
+                end
+            end
+            eliCell = cellfun(@(dir,eliTree) [dir;eliTree], dirCell, eliTreeCell, 'UniformOutput', false);
+
+            % Primal DOFs
+            priCell = treeOnCICell;
+            for i=1:numel(nrbcell)
+                if ismember(i,air_regions)
+                    priCell{i} = union(priCell{i},potPriCell{i});
+                end
+            end
+
+            % Remaining DOFs
+            remCell = cellfun(@(sp,pri,eli) setdiff((1:sp.ndof)',union(eli,pri)), spCurlCell, priCell, eliCell, 'UniformOutput', false);
+    
+            % Splitting of remaining DOFs for preconditioning
+            remIntCell = cellfun(@(rem,ieti) intersect(rem,ieti), remCell, ietiCell, 'UniformOutput', false);
+            remVolCell = cellfun(@(rem,remInt) setdiff(rem,remInt), remCell, remIntCell, 'UniformOutput', false);
+
+            subsets = cell(numel(treeCell),1);
+            for i = 1:numel(treeCell)
+                subsets{i}.eli = eliCell{i};
+                subsets{i}.rem = remCell{i};
+                subsets{i}.pri = priCell{i};
+    
+                subsets{i}.remVol = remVolCell{i};
+                subsets{i}.remInt = remIntCell{i};
+            end
+
+            % figure(1)
+            % clf()
+            % hold on;
+            % for i = 1:numel(nrbcell)
+            %     shift = nrbeval(nrbcell{i},[0.5,0.5,0.5]) - mid;
+            %     marked = {eliCell{i},priCell{i}};
+            %     plot_graph_and_marked(locGraphCell{i},marked,[],shift,[],[],3,2,['r','b','c','m'])
+            % end
+       
+            %% Setup IETI-constraints
+            [B,Cnull] = setupCouplingMatTI(gnumCurl,ndofCumu(end));
+    
+            %% Compute multiplier subsets
+            remCell = cellfun(@(set,ndof) ndof + set.rem, subsets, num2cell(ndofCumu(1:end-1))', 'UniformOutput', false);
+            [remMults,~,~] = find(B(:,vertcat(remCell{:})));
+            remMults = unique(remMults);
+    
+            priCell = cellfun(@(set,ndof) ndof + set.pri, subsets, num2cell(ndofCumu(1:end-1))', 'UniformOutput', false);
+            [priMults,~,~] = find(B(:,vertcat(priCell{:})));
+            priMults = unique(priMults);
+    
+            multNeli = union(priMults,remMults);
+            [~,multPri,~] = intersect(multNeli,priMults);
+            [~,multRem,~] = intersect(multNeli,remMults);
+    
+            for i=1:numel(subsets)
+                subsets{i}.multPri = multPri;
+                subsets{i}.multRem = multRem;
+            end
+    
+            %% Construct RHS for fully eliminated constraints
+            geSCell = cellfun(@(gDir,eliTree) [gDir;zeros(numel(eliTree),1)], gDirCell, eliTreeCell, 'UniformOutput', false);
+    
+            %% Assemble nullspace representation
+            B = B(multNeli,:);
+    
+            [~,pri2keep,~] = find(Cnull(vertcat(priCell{:}),:));
+            pri2keep = unique(pri2keep);
+            Cnull = Cnull(vertcat(priCell{:}),pri2keep);
+    
+            coarseSize(k,p,s,:) = numel(pri2keep);
+
+            %% Compute initial condition from mp-problem
+            [~, boundaries, interfaces, ~, boundary_interfaces] = mp_geo_load([nrbcell{:}]);
+            msh_mp = msh_multipatch(mshCell,boundaries);
+            spCurl_mp = sp_multipatch(spCurlCell,msh_mp,interfaces,boundary_interfaces);
+            fInit = op_f_v_mp(spCurl_mp, msh_mp, initFun);
+            ML2_mp = op_u_v_mp(spCurl_mp, spCurl_mp, msh_mp, @(x,y,z) ones(size(x)));
+            % [gDir_mp,dir_mp] = sp_drchlt_l2_proj(spCurl_mp, msh_mp, dirFunS, 1:numel(boundaries));
+            % vol_mp = setdiff(1:spCurl_mp.ndof,dir_mp);
+    
+            u0_mp = ML2_mp\fInit;
+            % u0_mp(dir_mp) = gDir_mp*timeDep(t0);
+            % u0_mp(vol_mp) = ML2_mp(vol_mp,vol_mp)\(fInit(vol_mp) - ML2_mp(vol_mp,dir_mp)*u0_mp(dir_mp));
+    
+            u0Cell = cell(numel(nrbcell),1);
+            for i=1:numel(nrbcell)
+                u0Cell{i} = u0_mp(gnumCurl{i});
+            end
+
+            %% Minor preparations for class structure
+            nPriCumuCell = cellfun(@(set) numel(set.pri), subsets, 'UniformOutput', false);
+            nPriCumu = cumsum([0,nPriCumuCell{:}]);
+
+            sys = FullSystemDD(subsets);
+            sys.setCouplingRHS(zeros(numel(multNeli),1));
+            sys.setNullRepresentations(cellfun(@(low,upp) Cnull(low:upp,:), num2cell(nPriCumu(1:end-1)+1), num2cell(nPriCumu(2:end)), 'UniformOutput', false));
+
+            KCell = cellfun(@(sp, msh, ind) op_curlu_curlv_tp(sp, sp, msh, @(x,y,z) nu(x,y,z,ind)), spCurlCell, mshCell, indCell, 'UniformOutput', false);
+            MCell = cellfun(@(sp, msh, ind) op_u_v_tp(sp, sp, msh, @(x,y,z) sigma(x,y,z,ind)), spCurlCell, mshCell, indCell, 'UniformOutput', false);
+            fSCell = cellfun(@(sp, msh, ind) op_f_v_tp(sp, msh, @(x,y,z) sourceFunS(x,y,z,ind)), spCurlCell, mshCell, indCell, 'UniformOutput', false);
+
+            for q = 1:numel(steps)
+                fprintf('Simulating setup with N=%i, p=%i, s=%i, nT=%i:\n', numel(nrbcell),degrees(p),divs(s),steps(q));
+                
+                sys.reset();
+
+                nT = steps(q);
+                time = linspace(t0,tend,nT);
+                dt = time(2) - time(1);
+
+                %% Setup subdomain structure for time stepsize
+                sys.setSystemMatrices(cellfun(@(M,K) M + dt*K, MCell, KCell, 'UniformOutput', false));
+                sys.setCouplingMatrices(cellfun(@(low,upp) dt*B(:,low:upp), num2cell(ndofCumu(1:end-1)+1), num2cell(ndofCumu(2:end)), 'UniformOutput', false));
+                sys.precomputeScaleMat(0);
+
+                %% Compute coarse problem matrix
+                sys.assembleCoarseF();
+                sys.factorizeCoarseF();
+
+                %% Evaluate RHS and eliminated function for every time step
+                fTSCell = cellfun(@(f) dt*timeDep(time(2:end)).*f, fSCell, 'UniformOutput', false);
+                geTSCell = cellfun(@(ge) timeDep(time(2:end)).*ge, geSCell, 'UniformOutput', false);
+
+                %% Initialize solution
+                solCell = u0Cell;
+
+                %% Error measurement in every time step (with initial cond.)
+                errBL2 = NaN*zeros(1,numel(time)-1);
+                errACL2 = NaN*zeros(1,numel(time)-1);
+                errECL2 = NaN*zeros(1,numel(time)-1);
+
+                %% Measurements of other stuff
+                condEstT = NaN*zeros(1,numel(time)-1);
+                numIterT = NaN*zeros(1,numel(time)-1);
+
+                for i = 1:numel(time)-1
+
+                    %% Set RHS and eliminated term for time step
+                    fCell = cellfun(@(fTS,M,x) fTS(:,i) + M*x(:,end), fTSCell, MCell, solCell, 'UniformOutput', false);
+                    sys.setRHSs(fCell);
+                    geCell = cellfun(@(geTS) geTS(:,i), geTSCell, 'UniformOutput', false);
+                    sys.setEliminatedRHSs(geCell);
+
+                    %% Computation of q
+                    sys.computeOrthPriSol();
+
+                    %% Computation of lamRem
+                    sys.computeE();
+                    sys.computeD();
+                    [eigEst,numIterT(i)] = sys.computeLamRem(1e-6,1e3);
+                    condEstT(i) = eigEst(2)/eigEst(1);
+
+                    %% tRecovery of p
+                    sys.recoverNullPriSol();
+
+                    %% Recovery of ar
+                    sys.recoverFullSol();
+                    aCell = sys.getSol();
+
+                    %% Compute error A and B
+                    [~,errACell,errBCell] = cellfun(@(sp,msh,a) sp_hcurl_error(sp, msh, a, @(x,y,z) AFun(x,y,z,time(i+1)), @(x,y,z) BFun(x,y,z,time(i+1))), spCurlCell, mshCell, aCell, 'UniformOutput', false);
+                    errBL2(i) = sqrt(sum([errBCell{:}].^2));
+                    errACL2(i) = sqrt(sum([errACell{copper_regions}].^2));
+
+                    %% Save solution for next time step
+                    solCell = cellfun(@(sol,a) [sol,a], solCell, aCell, 'UniformOutput', false);
+
+                    %% Compute error E
+                    errECL2(i) = 0;
+                    for l = 1:numel(copper_regions)
+                        ptc = copper_regions(l);
+                        dta = (solCell{ptc}(:,i+1) - solCell{ptc}(:,i))/dt;
+                        e = -dta;
+                        fun = @(t) errorHelper(t, e, spCurlCell{ptc}, mshCell{ptc}, EFun, BFun);
+                        % [~,val,~] = sp_hcurl_error(spCurlCell{ptc}, mshCell{ptc}, e, @(x,y,z) EFun(x,y,z,time(i+1)), @(x,y,z) BFun(x,y,z,time(i+1)));
+                        errECL2(i) = errECL2(i) + integral(fun, time(i), time(i+1), "AbsTol", 1e-11,"RelTol",0);
+                    end
+                    errECL2(i) = sqrt(errECL2(i));
+                end
+
+                %% Save measurements
+                errBL2max(k,p,s,q) = max(errBL2);
+                errACL2max(k,p,s,q) = max(errACL2);
+                errECL2max(k,p,s,q) = max(errECL2);
+
+                errB_acevedo(k,p,s,q) = sqrt(errBL2max(k,p,s,q)^2 + dt*sum(errBL2.^2));
+                errE_acevedo(k,p,s,q) = sqrt(dt*sum(errECL2.^2));
+
+                condEst(k,p,s,q) = mean(condEstT);
+                numIter(k,p,s,q) = mean(numIterT);
+
+                %% Export Measurements
+                % subs, deg, divs, steps, pri, cond, iter, errB, errA, errE
+                fprintf(fid, '%i,%i,%i,%i,%i,%.4d,%f,%.4d,%.4d,%.4d,%.4d,%.4d\n', numel(nrbcell), degrees(p), ...
+                divs(s), nT, coarseSize(k,p,s,q), condEst(k,p,s,q), numIter(k,p,s,q), errBL2max(k,p,s,q),...
+                errACL2max(k,p,s,q), errECL2max(k,p,s,q), errB_acevedo(k,p,s,q), errE_acevedo(k,p,s,q));
+
+            end
+        end
+    end
+end
